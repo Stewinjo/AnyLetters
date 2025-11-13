@@ -3,6 +3,7 @@
 # Includes solutions files and dictionary files
 
 import os
+from PyInstaller.utils.hooks import collect_data_files
 
 # Collect data files to include
 datas = []
@@ -15,6 +16,9 @@ if os.path.isdir('solutions'):
 dict_submodule = os.path.join('external', 'dictionaries', 'dictionaries')
 if os.path.isdir(dict_submodule):
     datas.append((dict_submodule, dict_submodule))
+
+# Include better_profanity resource files
+datas += collect_data_files('better_profanity')
 
 a = Analysis(
     ['main.py'],

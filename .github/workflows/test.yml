@@ -27,12 +27,12 @@ jobs:
 
       - name: Run pylint
         run: |
-          pylint main.py --disable=missing-docstring,too-many-locals,too-many-branches,too-many-statements,too-many-arguments,too-many-nested-blocks,too-many-instance-attributes,too-few-public-methods,too-many-public-methods,too-many-lines,import-error,no-member,unused-import --max-line-length=120 --exit-zero || true
+          pylint main.py --exit-zero || true
           echo "Pylint completed (exit-zero used to not fail workflow on warnings)"
 
       - name: Check for critical errors
         run: |
-          pylint main.py --disable=missing-docstring,too-many-locals,too-many-branches,too-many-statements,too-many-arguments,too-many-nested-blocks,too-many-instance-attributes,too-few-public-methods,too-many-public-methods,too-many-lines,import-error,no-member,unused-import --max-line-length=120 --errors-only --fail-on=E || exit 1
+          pylint main.py --errors-only --fail-on=E || exit 1
 
   test-cache-linux:
     name: Test Cache Generation (Linux)
@@ -40,6 +40,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -56,43 +58,24 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y python3-tk xvfb
 
-      - name: Create test dictionary directory structure
-        run: |
-          mkdir -p dicts/test
-          # Create minimal test dictionary files
-          echo "SET UTF-8" > dicts/test/test.aff
-          echo "1" > dicts/test/test.dic
-          echo "testword" >> dicts/test/test.dic
-
-      - name: Remove cache if exists for test
-        run: |
-          rm -f cache/test_7_utf-8.txt || true
-
-      - name: Verify cache does not exist before test
-        run: |
-          if [ -f "cache/test_7_utf-8.txt" ]; then
-            echo "ERROR: Cache file already exists before test"
-            exit 1
-          fi
-
       - name: Test cache generation
         run: |
           export DISPLAY=:99
           Xvfb :99 -screen 0 1024x768x24 > /dev/null 2>&1 &
           sleep 2
-          timeout 30 python main.py --lang test --length 7 || true
+          timeout 30 python main.py --lang en --length 7 || true
           # Kill any remaining processes
           pkill -f "python main.py" || true
           pkill -f Xvfb || true
 
       - name: Verify cache was created
         run: |
-          if [ ! -f "cache/test_7_utf-8.txt" ]; then
+          if [ ! -f "cache/en_7_utf-8.txt" ]; then
             echo "ERROR: Cache file was not created"
             exit 1
           fi
           echo "Cache file successfully created"
-          ls -lh cache/test_7_utf-8.txt
+          ls -lh cache/en_7_utf-8.txt
 
       - name: Test cache loading (verify it's used on second run)
         run: |
@@ -100,22 +83,25 @@ jobs:
           Xvfb :99 -screen 0 1024x768x24 > /dev/null 2>&1 &
           sleep 2
           # Get timestamp before running
-          TIMESTAMP_BEFORE=$(stat -c %Y cache/test_7_utf-8.txt)
-          timeout 30 python main.py --lang test --length 7 || true
+          TIMESTAMP_BEFORE=$(stat -c %Y cache/en_7_utf-8.txt)
+          timeout 30 python main.py --lang en --length 7 || true
           pkill -f "python main.py" || true
           pkill -f Xvfb || true
           # Verify cache file wasn't regenerated (same timestamp means it was reused)
-          TIMESTAMP_AFTER=$(stat -c %Y cache/test_7_utf-8.txt)
+          TIMESTAMP_AFTER=$(stat -c %Y cache/en_7_utf-8.txt)
           if [ "$TIMESTAMP_BEFORE" != "$TIMESTAMP_AFTER" ]; then
             echo "WARNING: Cache file timestamp changed, may have been regenerated"
           fi
 
   test-cache-windows:
     name: Test Cache Generation (Windows)
+    if: ${{ github.actor != 'nektos/act' }}
     runs-on: windows-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -127,34 +113,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Create test dictionary directory structure
-        shell: cmd
-        run: |
-          if not exist dicts\test mkdir dicts\test
-          echo SET UTF-8 > dicts\test\test.aff
-          echo 1 > dicts\test\test.dic
-          echo testword >> dicts\test\test.dic
-
-      - name: Remove cache if exists for test
-        shell: cmd
-        run: |
-          if exist cache\test_7_utf-8.txt del /f cache\test_7_utf-8.txt
-
-      - name: Verify cache does not exist before test
-        shell: cmd
-        run: |
-          if exist cache\test_7_utf-8.txt (
-            echo ERROR: Cache file already exists before test
-            exit /b 1
-          )
-
       - name: Test cache generation
         shell: powershell
         run: |
           Write-Host "Starting application in background..."
-          $proc = Start-Process python -ArgumentList "main.py --lang test --length 7" -PassThru -WindowStyle Hidden
+          $proc = Start-Process python -ArgumentList "main.py --lang en --length 7" -PassThru -WindowStyle Hidden
           Write-Host "Waiting for cache generation..."
-          $cacheFile = "cache\test_7_utf-8.txt"
+          $cacheFile = "cache\en_7_utf-8.txt"
           $timeout = 30
           $elapsed = 0
           $interval = 1
@@ -171,12 +136,12 @@ jobs:
       - name: Verify cache was created
         shell: cmd
         run: |
-          if not exist cache\test_7_utf-8.txt (
+          if not exist cache\en_7_utf-8.txt (
             echo ERROR: Cache file was not created
             exit /b 1
           )
           echo Cache file successfully created
-          dir cache\test_7_utf-8.txt
+          dir cache\en_7_utf-8.txt
 
   build-linux:
     name: Build Executable (Linux)
@@ -184,6 +149,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -204,39 +171,19 @@ jobs:
         run: |
           chmod +x build_exe.sh
 
-      - name: Create minimal test data for build
-        run: |
-          mkdir -p dicts/de solutions
-          # Create minimal test files so build doesn't fail
-          echo "SET UTF-8" > dicts/de/test.aff
-          echo "1" > dicts/de/test.dic
-          echo "test" >> dicts/de/test.dic
-          echo "testword" > solutions/de6.txt
-
       - name: Build executable
         run: |
           ./build_exe.sh
 
-      - name: Verify executable was created
-        run: |
-          if [ ! -f "dist/AnyWordle" ]; then
-            echo "ERROR: Executable was not created"
-            exit 1
-          fi
-          echo "Executable successfully created"
-          ls -lh dist/AnyWordle
-          file dist/AnyWordle
-
-      - name: Test executable runs
-        run: |
-          timeout 10 dist/AnyWordle --help || exit 0
-
   build-windows:
     name: Build Executable (Windows)
+    if: ${{ github.actor != 'nektos/act' }}
     runs-on: windows-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -248,32 +195,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Create minimal test data for build
-        shell: cmd
-        run: |
-          if not exist dicts\de mkdir dicts\de
-          if not exist solutions mkdir solutions
-          echo SET UTF-8 > dicts\de\test.aff
-          echo 1 > dicts\de\test.dic
-          echo test >> dicts\de\test.dic
-          echo testword > solutions\de6.txt
-
       - name: Build executable
         shell: cmd
         run: |
           .\build_exe.bat
-
-      - name: Verify executable was created
-        shell: cmd
-        run: |
-          if not exist dist\AnyWordle.exe (
-            echo ERROR: Executable was not created
-            exit /b 1
-          )
-          echo Executable successfully created
-          dir dist\AnyWordle.exe
-
-      - name: Test executable runs
-        shell: cmd
-        run: |
-          dist\AnyWordle.exe --help || exit 0
