@@ -6,6 +6,8 @@ word length, configurable solutions and validates guesses using `.dic` and `.aff
 Author: stewinjo
 """
 
+# pylint: disable=too-many-lines
+
 __version__ = "1.0.0"
 
 import argparse
@@ -253,7 +255,7 @@ def parse_dic_entries(dic_path: str) -> list[tuple[str, str]]:
             entries.append((base_norm, flags))
     return entries
 
-class AffRules:
+class AffRules:  # pylint: disable=too-few-public-methods
     """Container for affix rules parsed from .aff files.
 
     Stores suffix (SFX) and prefix (PFX) rules keyed by flag characters.
@@ -264,7 +266,7 @@ class AffRules:
         self.sfx: dict[str, list[tuple[str, str, str]]] = {}
         self.pfx: dict[str, list[tuple[str, str, str]]] = {}
 
-    def add_rule(
+    def add_rule(  # pylint: disable=too-many-arguments,too-many-positional-arguments
         self, is_suffix: bool, flag: str, strip: str, add: str, cond: str
     ) -> None:
         """Add an affix rule.
@@ -322,7 +324,7 @@ def parse_aff_rules(aff_path: str) -> AffRules:
                 rules.add_rule(type_tag == "SFX", flag, strip, add, cond)
     return rules
 
-def _generate_affixed_candidates(
+def _generate_affixed_candidates(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-branches
     base: str,
     flags: str,
     rules: AffRules,
@@ -684,7 +686,9 @@ def _load_or_build_filtered_solutions(
     return filtered
 
 
-def _looks_plural_en(word: str, catalog: set[str]) -> bool:
+def _looks_plural_en(  # pylint: disable=too-many-return-statements,too-many-branches
+    word: str, catalog: set[str]
+) -> bool:
     """Heuristic to detect English plural forms using dictionary presence."""
 
     w = word.lower()
@@ -740,7 +744,9 @@ def _looks_past_tense_en(word: str, catalog: set[str]) -> bool:
     return False
 
 
-def _looks_plural_de(word: str, catalog: set[str]) -> bool:
+def _looks_plural_de(  # pylint: disable=too-many-return-statements
+    word: str, catalog: set[str]
+) -> bool:
     """Heuristic to detect German plural nouns using dictionary presence."""
 
     w = word.lower()
@@ -778,7 +784,7 @@ def _looks_past_tense_de(word: str, catalog: set[str]) -> bool:
     if w.startswith("ge") and len(w) > 4:
         if w.endswith("t"):
             stem = w[2:-1]
-            if (stem + "en") in catalog:
+            if stem + "en" in catalog:
                 return True
         if w.endswith("en"):
             stem = w[2:]
@@ -995,7 +1001,7 @@ def _to_key_char(ch: str, lang: str) -> str:
         return ch.upper()
     return ch.upper()
 
-def play_gui(
+def play_gui(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals,too-many-branches,too-many-statements
     word_length: int,
     solutions_path: str,
     dict_folder: str,
@@ -1056,14 +1062,20 @@ def play_gui(
         if dictionary_candidates:
             if solutions_file_found:
                 logger.warning(
-                    "Solutions file '%s' contains no words of length %d will use %d dictionary words instead.",
+                    (
+                        "Solutions file '%s' contains no words of length %d; "
+                        "using %d dictionary words instead."
+                    ),
                     solutions_path,
                     word_length,
                     len(dictionary_candidates),
                 )
             else:
                 logger.warning(
-                    "No solutions file found. Tried: %s will use %d dictionary words instead.",
+                    (
+                        "No solutions file found (tried: %s); "
+                        "using %d dictionary words instead."
+                    ),
                     solutions_path,
                     len(dictionary_candidates),
                 )
@@ -1287,7 +1299,9 @@ def play_gui(
             pady=layout.restart_button_internal_pady,
         )
 
-    def apply_layout(layout: Layout) -> None:
+    def apply_layout(  # pylint: disable=too-many-nested-blocks
+        layout: Layout,
+    ) -> None:
         """Apply scaled padding and spacing across the UI."""
 
         status_label.pack_configure(
@@ -1543,7 +1557,7 @@ def play_gui(
         status_var.set("")
         apply_easy_hint()
 
-    def submit_guess_from_cells() -> None:
+    def submit_guess_from_cells() -> None:  # pylint: disable=too-many-statements
         """Process and submit the current guess from input cells."""
         nonlocal game_over
         if game_over:
@@ -1646,7 +1660,9 @@ def play_gui(
                 pady=layout_local.guess_row_pady,
             )
 
-    def update_keyboard(guess_text: str, markers: list[str]) -> None:
+    def update_keyboard(  # pylint: disable=too-many-locals
+        guess_text: str, markers: list[str]
+    ) -> None:
         """Update keyboard letter colors based on guess feedback.
 
         Args:
@@ -1756,7 +1772,7 @@ def play_gui(
     root.minsize(360, 640)
     root.mainloop()
 
-def main() -> None:
+def main() -> None:  # pylint: disable=too-many-locals,too-many-statements
     """Parse arguments for language and length, then start the GUI game."""
     # Configure logging (console)
     logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
