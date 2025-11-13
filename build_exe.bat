@@ -29,10 +29,17 @@ if not exist "dist\%NAME%.exe" (
 )
 
 echo Testing --list argument...
-powershell -NoProfile -Command "& {$proc = Start-Process -FilePath 'dist\%NAME%.exe' -ArgumentList '--list' -PassThru -WindowStyle Hidden; if ($proc.WaitForExit(5000)) { exit $proc.ExitCode } else { Stop-Process -Id $proc.Id -Force; exit 1 }}" >nul 2>&1
-if %ERRORLEVEL% EQU 0 (
+set "TMP_OUTPUT=%TEMP%\anyletters_list_%RANDOM%.log"
+dist\%NAME%.exe --list >"%TMP_OUTPUT%" 2>&1
+set "EXIT_CODE=%ERRORLEVEL%"
+if "%EXIT_CODE%"=="0" (
     echo [OK] --list argument works
 ) else (
-    echo ERROR: --list test failed or timed out!
-    exit /b 1
+    echo ERROR: --list test failed (exit code: %EXIT_CODE%)
+    echo ----- command output -----
+    type "%TMP_OUTPUT%"
+    echo --------------------------
+    del "%TMP_OUTPUT%"
+    exit /b %EXIT_CODE%
 )
+del "%TMP_OUTPUT%"
