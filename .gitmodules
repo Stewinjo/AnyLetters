@@ -1,0 +1,3 @@
+[submodule "external/dictionaries"]
+	path = external/dictionaries
+	url = https://github.com/wooorm/dictionaries

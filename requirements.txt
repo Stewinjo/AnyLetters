@@ -1,0 +1,2 @@
+better_profanity>=0.7
+pyinstaller>=6.4.0

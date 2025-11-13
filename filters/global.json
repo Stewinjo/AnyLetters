@@ -1,0 +1,9 @@
+{
+  "prefixes": [],
+  "suffixes": [],
+  "blacklist": [],
+  "blacklist_files": [
+    "global_names.txt",
+    "global_companies.txt"
+  ]
+}

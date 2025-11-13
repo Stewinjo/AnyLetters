@@ -1,0 +1,6 @@
+{
+  "prefixes": [],
+  "suffixes": [],
+  "blacklist": [],
+  "blacklist_files": ["de_countries.txt"]
+}
