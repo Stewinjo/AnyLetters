@@ -23,16 +23,15 @@ jobs:
       - name: Install linting dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pylint
+          pip install -r requirements-dev.txt
 
-      - name: Run pylint
+      - name: Run pylint (errors only)
         run: |
-          pylint main.py --exit-zero || true
-          echo "Pylint completed (exit-zero used to not fail workflow on warnings)"
+          pylint main.py filter.py style.py bake_defaults.py --errors-only --fail-on=E
 
-      - name: Check for critical errors
+      - name: Run pre-commit
         run: |
-          pylint main.py --errors-only --fail-on=E || exit 1
+          pre-commit run --all-files
 
   test-cache-linux:
     name: Test Cache Generation (Linux)
@@ -58,6 +57,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y python3-tk xvfb
 
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
+
       - name: Test cache generation
         run: |
           export DISPLAY=:99
@@ -70,12 +72,12 @@ jobs:
 
       - name: Verify cache was created
         run: |
-          if [ ! -f "cache/en_7_utf-8.txt" ]; then
+          if [ ! -f "cache/en_7_v3.txt" ]; then
             echo "ERROR: Cache file was not created"
             exit 1
           fi
           echo "Cache file successfully created"
-          ls -lh cache/en_7_utf-8.txt
+          ls -lh cache/en_7_v3.txt
 
       - name: Test cache loading (verify it's used on second run)
         run: |
@@ -83,12 +85,12 @@ jobs:
           Xvfb :99 -screen 0 1024x768x24 > /dev/null 2>&1 &
           sleep 2
           # Get timestamp before running
-          TIMESTAMP_BEFORE=$(stat -c %Y cache/en_7_utf-8.txt)
+          TIMESTAMP_BEFORE=$(stat -c %Y cache/en_7_v3.txt)
           timeout 30 python main.py --lang en --length 7 || true
           pkill -f "python main.py" || true
           pkill -f Xvfb || true
           # Verify cache file wasn't regenerated (same timestamp means it was reused)
-          TIMESTAMP_AFTER=$(stat -c %Y cache/en_7_utf-8.txt)
+          TIMESTAMP_AFTER=$(stat -c %Y cache/en_7_v3.txt)
           if [ "$TIMESTAMP_BEFORE" != "$TIMESTAMP_AFTER" ]; then
             echo "WARNING: Cache file timestamp changed, may have been regenerated"
           fi
@@ -113,13 +115,16 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
+
       - name: Test cache generation
         shell: powershell
         run: |
           Write-Host "Starting application in background..."
           $proc = Start-Process python -ArgumentList "main.py --lang en --length 7" -PassThru -WindowStyle Hidden
           Write-Host "Waiting for cache generation..."
-          $cacheFile = "cache\en_7_utf-8.txt"
+          $cacheFile = "cache\en_7_v3.txt"
           $timeout = 30
           $elapsed = 0
           $interval = 1
@@ -136,12 +141,12 @@ jobs:
       - name: Verify cache was created
         shell: cmd
         run: |
-          if not exist cache\en_7_utf-8.txt (
+          if not exist cache\en_7_v3.txt (
             echo ERROR: Cache file was not created
             exit /b 1
           )
           echo Cache file successfully created
-          dir cache\en_7_utf-8.txt
+          dir cache\en_7_v3.txt
 
   build-linux:
     name: Build Executable (Linux)
@@ -168,12 +173,60 @@ jobs:
           sudo apt-get install -y python3-tk
 
       - name: Make build script executable
-        run: |
-          chmod +x build_exe.sh
+        run: chmod +x build_exe.sh
 
       - name: Build executable
+        run: ./build_exe.sh
+
+      - name: Verify packaged binary
         run: |
-          ./build_exe.sh
+          test -f dist/AnyLetters
+          dist/AnyLetters --list | head -n 5
+
+  build-linux-baked:
+    name: Build Baked Executable (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Install tkinter (for build)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-tk
+
+      - name: Prepare baked solutions file
+        run: |
+          mkdir -p solutions
+          printf 'Hachen\nStefan\nHolger\nVolker\nOliver\nMarius\n' > solutions/de6.txt
+
+      - name: Make build script executable
+        run: chmod +x build_exe.sh
+
+      - name: Build baked German executable
+        run: |
+          ./build_exe.sh --lang de --length 6 --difficulty easy --require-solutions --exe-name AnyLettersDE
+
+      - name: Verify baked defaults
+        run: |
+          test -f dist/AnyLettersDE
+          HELP="$(dist/AnyLettersDE --help)"
+          echo "$HELP" | grep -q 'default: de'
+          echo "$HELP" | grep -q 'default: 6'
+          echo "$HELP" | grep -q 'default: easy'
+          python -c "import json; d=json.load(open('defaults.json', encoding='utf-8')); assert d['lang']=='de' and d['length']==6 and d['difficulty']=='easy' and d['exe_name']=='AnyLettersDE'"
 
   build-windows:
     name: Build Executable (Windows)
@@ -197,5 +250,54 @@ jobs:
 
       - name: Build executable
         shell: cmd
+        run: .\build_exe.bat
+
+      - name: Verify packaged binary
+        shell: cmd
         run: |
-          .\build_exe.bat
+          if not exist dist\AnyLetters.exe exit /b 1
+          dist\AnyLetters.exe --list
+
+  build-windows-baked:
+    name: Build Baked Executable (Windows)
+    if: ${{ github.actor != 'nektos/act' }}
+    runs-on: windows-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Prepare baked solutions file
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force -Path solutions | Out-Null
+          Set-Content -Path solutions\de6.txt -Value "Hachen`nStefan`nHolger`nVolker`nOliver`nMarius"
+
+      - name: Build baked German executable
+        shell: cmd
+        run: .\build_exe.bat --lang de --length 6 --difficulty easy --require-solutions --exe-name AnyLettersDE
+
+      - name: Verify baked defaults
+        shell: powershell
+        run: |
+          if (-not (Test-Path dist\AnyLettersDE.exe)) { throw "missing baked exe" }
+          $help = & dist\AnyLettersDE.exe --help | Out-String
+          if ($help -notmatch "default: de") { throw "lang default missing" }
+          if ($help -notmatch "default: 6") { throw "length default missing" }
+          if ($help -notmatch "default: easy") { throw "difficulty default missing" }
+          $defaults = Get-Content defaults.json -Raw | ConvertFrom-Json
+          if ($defaults.lang -ne "de") { throw "defaults.json lang" }
+          if ($defaults.length -ne 6) { throw "defaults.json length" }
+          if ($defaults.difficulty -ne "easy") { throw "defaults.json difficulty" }
+          if ($defaults.exe_name -ne "AnyLettersDE") { throw "defaults.json exe_name" }

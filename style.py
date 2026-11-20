@@ -97,9 +97,7 @@ def _register_font_file(path: Path) -> None:
             if added:
                 _REGISTERED_FONTS.add(path)
                 # Notify system font list changed (best effort).
-                windll.user32.SendMessageTimeoutW(
-                    0xFFFF, 0x001D, 0, 0, 0, 100, 0
-                )
+                windll.user32.SendMessageTimeoutW(0xFFFF, 0x001D, 0, 0, 0, 100, 0)
                 return
         except OSError:
             pass

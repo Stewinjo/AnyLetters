@@ -1,0 +1,14 @@
+# Normalize text files to LF in the repository and working tree.
+* text=auto eol=lf
+
+# Keep Windows batch files on CRLF.
+*.bat text eol=crlf
+
+# Treat binary / dictionary data as binary.
+*.dic binary
+*.aff binary
+*.ttf binary
+*.otf binary
+*.png binary
+*.jpg binary
+*.ico binary

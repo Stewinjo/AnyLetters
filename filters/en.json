@@ -1,6 +1,6 @@
 {
   "prefixes": [],
-  "suffixes": ["ing", "est", "iest", "ed", "s", "'s", "\u2019s"],
+  "suffixes": [],
   "blacklist": [],
   "blacklist_files": ["en_countries.txt"]
 }

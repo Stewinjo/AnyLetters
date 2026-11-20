@@ -4,18 +4,24 @@ from __future__ import annotations
 
 import json
 import os
+import sys
+import unicodedata
 from dataclasses import dataclass, field
 from functools import lru_cache
 from collections.abc import Iterable
 
 try:
     from better_profanity import profanity as _profanity
-except ImportError:  # pragma: no cover - optional dependency
+except (ImportError, OSError):  # pragma: no cover - optional dependency
     _profanity = None
 else:
-    _profanity.load_censor_words()
+    try:
+        _profanity.load_censor_words()
+    except (OSError, ValueError):  # pragma: no cover - broken install
+        _profanity = None
 
 __all__ = [
+    "CACHE_VERSION",
     "apply_language_filters",
     "clear_filtered_solution_cache",
     "filter_candidates",
@@ -24,10 +30,20 @@ __all__ = [
     "solution_cache_path",
 ]
 
+# Bump when dictionary parsing or solution filtering changes so old files
+# are left unread instead of being treated as current.
+CACHE_VERSION = "3"
+
 
 @dataclass(slots=True)
 class FilterConfig:
-    """Configuration describing blacklist and affix filters for a language."""
+    """Configuration describing blacklist entries for a language.
+
+    Prefix and suffix lists are still loaded so existing JSON files stay valid.
+    They are not applied as raw ``startswith`` / ``endswith`` checks, because
+    that also removed ordinary words such as ``chaos``, ``forest``, and
+    ``sacred``. Inflection handling lives in the difficulty selector.
+    """
 
     prefixes: tuple[str, ...] = field(default_factory=tuple)
     suffixes: tuple[str, ...] = field(default_factory=tuple)
@@ -36,9 +52,40 @@ class FilterConfig:
 
 
 def _config_root() -> str:
-    """Return the directory containing language filter JSON files."""
+    """Return the directory containing language filter JSON files.
 
+    Frozen builds look in the PyInstaller resource directory. Running from
+    source uses the ``filters`` directory next to this module.
+    """
+
+    bundle_root = getattr(sys, "_MEIPASS", None)
+    if bundle_root:
+        bundled = os.path.join(bundle_root, "filters")
+        if os.path.isdir(bundled):
+            return bundled
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), "filters")
+
+
+def fold_blacklist_key(word: str) -> str:
+    """Return a blacklist key that treats German transliterations as equal.
+
+    ``ä``/``ö``/``ü``/``ß`` fold to ``ae``/``oe``/``ue``/``ss``, so a list
+    entry such as ``aegypten`` matches the dictionary word ``Ägypten``.
+
+    Args:
+        word: Word or blacklist entry to fold.
+
+    Returns:
+        Case-folded, transliteration-folded key.
+    """
+
+    folded = unicodedata.normalize("NFC", word).casefold()
+    return (
+        folded.replace("ä", "ae")
+        .replace("ö", "oe")
+        .replace("ü", "ue")
+        .replace("ß", "ss")
+    )
 
 
 def _config_path(archetype: str) -> str:
@@ -94,6 +141,9 @@ class LanguageFilter:
 
         self.archetype = archetype
         self._config = load_filter_config(archetype)
+        self._blacklist_keys = {
+            fold_blacklist_key(word) for word in self._config.blacklist
+        }
 
     @property
     def config(self) -> FilterConfig:
@@ -102,7 +152,15 @@ class LanguageFilter:
         return self._config
 
     def apply(self, words: Iterable[str], _catalog: set[str]) -> list[str]:
-        """Apply configured blacklist, affix exclusions, and profanity checks."""
+        """Apply the blacklist and profanity checks.
+
+        Args:
+            words: Candidate solution words.
+            _catalog: Unused. Kept so callers can pass the dictionary catalog.
+
+        Returns:
+            Sorted words that are alphabetic, not profane, and not blacklisted.
+        """
 
         processed: list[str] = []
         seen: set[str] = set()
@@ -112,25 +170,13 @@ class LanguageFilter:
                 continue
             if _contains_profanity(word):
                 continue
-            if lower in self.config.blacklist:
-                continue
-            if self._matches_prefix(lower) or self._matches_suffix(lower):
+            if fold_blacklist_key(lower) in self._blacklist_keys:
                 continue
             if lower in seen:
                 continue
             processed.append(word)
             seen.add(lower)
         return sorted(processed)
-
-    def _matches_prefix(self, word_lower: str) -> bool:
-        """Return True if the word begins with a disallowed prefix."""
-
-        return any(word_lower.startswith(prefix) for prefix in self.config.prefixes)
-
-    def _matches_suffix(self, word_lower: str) -> bool:
-        """Return True if the word ends with a disallowed suffix."""
-
-        return any(word_lower.endswith(suffix) for suffix in self.config.suffixes)
 
 
 def filter_candidates(
@@ -230,18 +276,42 @@ def _ensure_solution_cache_dir() -> str:
     return cache_dir
 
 
-def solution_cache_path(lang: str, word_length: int) -> str:
-    """Return the cache path for a filtered solution list."""
+def solution_cache_path(
+    lang: str,
+    word_length: int,
+    difficulty: str = "medium",
+    *,
+    use_filters: bool = True,
+) -> str:
+    """Return the cache path for one language, length, and difficulty.
+
+    Args:
+        lang: Language code.
+        word_length: Target word length.
+        difficulty: Difficulty whose solution pool is cached.
+        use_filters: Whether blacklist and profanity filters were applied.
+
+    Returns:
+        Path of the solution-cache file.
+    """
 
     directory = _ensure_solution_cache_dir()
-    filename = f"{lang}_{word_length}.txt"
+    mode = "filtered" if use_filters else "raw"
+    safe_difficulty = (difficulty or "medium").strip().lower()
+    filename = f"{lang}_{word_length}_{safe_difficulty}_{mode}_v{CACHE_VERSION}.txt"
     return os.path.normpath(os.path.join(directory, filename))
 
 
-def load_filtered_solution_cache(lang: str, word_length: int) -> list[str]:
-    """Load previously generated filtered solutions for a language/length pair."""
+def load_filtered_solution_cache(
+    lang: str,
+    word_length: int,
+    difficulty: str = "medium",
+    *,
+    use_filters: bool = True,
+) -> list[str]:
+    """Load a cached solution list for a language, length, and difficulty."""
 
-    path = solution_cache_path(lang, word_length)
+    path = solution_cache_path(lang, word_length, difficulty, use_filters=use_filters)
     if not os.path.isfile(path):
         return []
     with open(path, "r", encoding="utf-8") as handle:
@@ -249,11 +319,16 @@ def load_filtered_solution_cache(lang: str, word_length: int) -> list[str]:
 
 
 def save_filtered_solution_cache(
-    lang: str, word_length: int, words: Iterable[str]
+    lang: str,
+    word_length: int,
+    words: Iterable[str],
+    difficulty: str = "medium",
+    *,
+    use_filters: bool = True,
 ) -> None:
-    """Persist filtered solutions to disk for future runs."""
+    """Persist a solution list for a later run of the same difficulty."""
 
-    path = solution_cache_path(lang, word_length)
+    path = solution_cache_path(lang, word_length, difficulty, use_filters=use_filters)
     unique_sorted = sorted(dict.fromkeys(words))
     with open(path, "w", encoding="utf-8") as handle:
         for word in unique_sorted:

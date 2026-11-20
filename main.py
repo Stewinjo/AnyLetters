@@ -8,9 +8,11 @@ Author: stewinjo
 
 # pylint: disable=too-many-lines
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 import argparse
+import codecs
+import json
 import logging
 import os
 import random
@@ -18,7 +20,7 @@ import re
 import sys
 import tkinter as tk
 from collections import Counter
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from tkinter import font as tkfont
 import unicodedata
@@ -33,14 +35,25 @@ from style import (
     load_fonts,
 )
 from filter import (
+    CACHE_VERSION,
     apply_language_filters,
     clear_filtered_solution_cache,
-    load_filter_config,
     load_filtered_solution_cache,
     save_filtered_solution_cache,
 )
 
 USED_SOLUTIONS: set[str] = set()
+_MAX_WORD_LENGTH = 30
+_DEFAULTS_FILENAME = "defaults.json"
+_STOCK_DEFAULTS = {
+    "lang": "en",
+    "length": 6,
+    "difficulty": "medium",
+    "disable_solution_filters": False,
+    "exe_name": "AnyLetters",
+    "hide_secret": True,
+}
+
 
 def _resource_path(relative_path: str) -> str:
     """Get absolute path to resource, works for dev and PyInstaller.
@@ -60,11 +73,13 @@ def _resource_path(relative_path: str) -> str:
         base_path = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(base_path, relative_path)
 
+
 def _dictionaries_root() -> str:
     """Return the absolute path to the dictionaries submodule root."""
     return os.path.normpath(
         _resource_path(os.path.join("external", "dictionaries", "dictionaries"))
     )
+
 
 def _available_dictionary_codes() -> dict[str, str]:
     """Return mapping of normalized language codes to canonical directory names."""
@@ -83,6 +98,7 @@ def _available_dictionary_codes() -> dict[str, str]:
             mapping[entry.lower()] = entry
     return mapping
 
+
 def _print_available_languages() -> int:
     """Print available language codes from the dictionaries submodule."""
     mapping = _available_dictionary_codes()
@@ -99,6 +115,7 @@ def _print_available_languages() -> int:
         print(f"  {canonical}")
     return 0
 
+
 def _find_matching_dict_pairs(directory: str) -> list[tuple[str, str]]:
     """Find all matching .aff/.dic file pairs by base name.
 
@@ -109,9 +126,7 @@ def _find_matching_dict_pairs(directory: str) -> list[tuple[str, str]]:
         List of (aff_path, dic_path) tuples for matching pairs.
     """
     if not os.path.isdir(directory):
-        raise FileNotFoundError(
-            f"Dictionary directory '{directory}' does not exist."
-        )
+        raise FileNotFoundError(f"Dictionary directory '{directory}' does not exist.")
 
     pairs: list[tuple[str, str]] = []
     aff_files: dict[str, str] = {}
@@ -137,11 +152,11 @@ def _find_matching_dict_pairs(directory: str) -> list[tuple[str, str]]:
 
 def _load_dictionary_components(
     dict_pairs: list[tuple[str, str]], logger: logging.Logger
-) -> tuple["AffRules", list[tuple[str, str]]]:
+) -> tuple["AffRules", list[tuple[str, tuple[str, ...]]]]:
     """Load affix rules and dictionary entries from matching pairs."""
 
     combined_rules = AffRules()
-    all_entries: list[tuple[str, str]] = []
+    all_entries: list[tuple[str, tuple[str, ...]]] = []
 
     for aff_path, dic_path in dict_pairs:
         rules = parse_aff_rules(aff_path)
@@ -149,8 +164,11 @@ def _load_dictionary_components(
             combined_rules.sfx.setdefault(flag, []).extend(rule_list)
         for flag, rule_list in rules.pfx.items():
             combined_rules.pfx.setdefault(flag, []).extend(rule_list)
+        combined_rules.forbidden_flags.update(rules.forbidden_flags)
+        combined_rules.need_affix_flags.update(rules.need_affix_flags)
+        combined_rules.only_compound_flags.update(rules.only_compound_flags)
 
-        entries = parse_dic_entries(dic_path)
+        entries = parse_dic_entries(dic_path, rules.encoding, rules.flag_mode)
         all_entries.extend(entries)
         logger.info(
             "Loaded dictionary pair: %s/%s (%d entries)",
@@ -160,6 +178,7 @@ def _load_dictionary_components(
         )
 
     return combined_rules, all_entries
+
 
 def _normalize_word(word: str) -> str:
     """Normalize word to NFC Unicode and lowercase.
@@ -171,6 +190,176 @@ def _normalize_word(word: str) -> str:
         Normalized word in NFC form and lowercase.
     """
     return unicodedata.normalize("NFC", word).lower()
+
+
+def _is_letter_word(word: str) -> bool:
+    """Return True when every character is a letter.
+
+    Args:
+        word: Candidate token.
+
+    Returns:
+        True for alphabetic words, including accented letters and ß.
+    """
+
+    return bool(word) and word.isalpha()
+
+
+def _display_char(ch: str) -> str:
+    """Return the one-cell label for a typed character.
+
+    Python uppercases ß to the two-character string ``SS``. The board stores
+    one character per cell, so ß is shown as ß.
+
+    Args:
+        ch: Character to display.
+
+    Returns:
+        A single display character when the uppercase form is one character.
+    """
+
+    if not ch:
+        return ch
+    if ch.casefold() == "ß":
+        return "ß"
+    upper = ch.upper()
+    if len(upper) == 1:
+        return upper
+    return ch
+
+
+def _split_flags(flags: str, mode: str) -> tuple[str, ...]:
+    """Split a Hunspell flag field.
+
+    Args:
+        flags: Flag field from a dictionary entry, without the leading slash.
+        mode: ``char``, ``long``, or ``num``.
+
+    Returns:
+        Individual flag tokens. Empty when ``flags`` is empty.
+    """
+
+    if not flags:
+        return ()
+    if mode == "num":
+        return tuple(part for part in flags.split(",") if part)
+    if mode == "long":
+        pair_length = len(flags) - (len(flags) % 2)
+        return tuple(flags[index : index + 2] for index in range(0, pair_length, 2))
+    return tuple(flags)
+
+
+def _split_affix_add(add_field: str) -> str:
+    """Return the letters an affix rule appends.
+
+    Hunspell writes continuation flags after a slash, as in ``innen/xyoc``.
+    Those flags are not part of the spelling.
+
+    Args:
+        add_field: Add column from an SFX or PFX rule.
+
+    Returns:
+        Letters to append. Empty when the column is ``0``.
+    """
+
+    add = add_field.split("/", 1)[0]
+    if add == "0":
+        return ""
+    return add
+
+
+def _python_encoding(name: str) -> str:
+    """Return a Python codec name for a Hunspell ``SET`` value.
+
+    Args:
+        name: Encoding token from the affix file.
+
+    Returns:
+        A codec ``codecs.lookup`` accepts, or ``utf-8`` when it does not.
+    """
+
+    cleaned = name.strip().replace("_", "-")
+    if cleaned.lower() in {"utf8", "utf-8"}:
+        cleaned = "utf-8"
+    try:
+        codecs.lookup(cleaned)
+    except LookupError:
+        return "utf-8"
+    return cleaned
+
+
+def _read_text(path: str, encoding: str) -> str:
+    """Read a dictionary file, trying fallback encodings if needed.
+
+    Args:
+        path: File to read.
+        encoding: Preferred encoding, usually from the affix ``SET`` line.
+
+    Returns:
+        File text without a leading byte-order mark.
+    """
+
+    for candidate in (encoding, "utf-8", "latin-1"):
+        try:
+            with open(path, "r", encoding=candidate) as handle:
+                return handle.read().lstrip("\ufeff")
+        except UnicodeDecodeError:
+            continue
+    with open(path, "r", encoding="utf-8", errors="replace") as handle:
+        return handle.read().lstrip("\ufeff")
+
+
+def _read_aff_text(path: str) -> tuple[str, str]:
+    """Read an affix file and detect its ``SET`` encoding.
+
+    Args:
+        path: Path to the ``.aff`` file.
+
+    Returns:
+        Tuple of file text and the Python encoding name.
+    """
+
+    with open(path, "rb") as handle:
+        raw = handle.read()
+    encoding = "utf-8"
+    head = raw[:4000].decode("ascii", errors="ignore")
+    for line in head.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[0] == "SET":
+            encoding = _python_encoding(parts[1])
+            break
+    try:
+        text = raw.decode(encoding)
+    except UnicodeDecodeError:
+        text = raw.decode("utf-8", errors="replace")
+        encoding = "utf-8"
+    return text.lstrip("\ufeff"), encoding
+
+
+def _affix_condition_matches(cond: str, stem: str, *, at_end: bool) -> bool:
+    """Return True when a Hunspell condition matches ``stem``.
+
+    Conditions are a small regular-expression subset. An invalid pattern does
+    not reject the candidate.
+
+    Args:
+        cond: Condition from the affix rule. ``.`` matches any character.
+        stem: Stem the condition is checked against.
+        at_end: True for suffixes, which must match the end of the stem.
+
+    Returns:
+        True when the condition matches or cannot be compiled.
+    """
+
+    if not cond:
+        return True
+    try:
+        if at_end:
+            return re.search(cond + r"$", stem) is not None
+        return re.match(r"^" + cond, stem) is not None
+    except re.error:
+        return True
+
 
 def read_solutions_file(solutions_path: str) -> list[str]:
     """Read non-empty lines from a solutions file.
@@ -188,6 +377,7 @@ def read_solutions_file(solutions_path: str) -> list[str]:
     with open(path, "r", encoding="utf-8") as f:
         return [w for w in (line.strip() for line in f) if w]
 
+
 def pick_random_solution(candidates: list[str], word_length: int) -> str:
     """Pick a random solution of the specified length from the candidates.
 
@@ -204,9 +394,10 @@ def pick_random_solution(candidates: list[str], word_length: int) -> str:
     filtered = list(w for w in candidates if len(w) == word_length)
     if not filtered:
         raise ValueError(
-            f"No solutions of length {word_length} found in solutions.txt"
+            f"No solutions of length {word_length} found in the solution list."
         )
     return random.choice(filtered)
+
 
 def pick_unused_solution(candidates: list[str], word_length: int) -> str | None:
     """Pick a random solution not used yet during this session.
@@ -219,52 +410,71 @@ def pick_unused_solution(candidates: list[str], word_length: int) -> str | None:
         Randomly selected unused word, or None if all have been used.
     """
     remaining = list(
-        w for w in candidates
-        if len(w) == word_length and w not in USED_SOLUTIONS
+        w for w in candidates if len(w) == word_length and w not in USED_SOLUTIONS
     )
     if not remaining:
         return None
     return random.choice(remaining)
 
-def parse_dic_entries(dic_path: str) -> list[tuple[str, str]]:
-    """Parse .dic entries into (base_word_norm_lower, flags_str).
+
+def parse_dic_entries(
+    dic_path: str,
+    encoding: str = "utf-8",
+    flag_mode: str = "char",
+) -> list[tuple[str, tuple[str, ...]]]:
+    """Parse .dic entries into (base_word, flags).
+
+    The first numeric line is the Hunspell word count and is skipped. Leading
+    tab comments, morphological fields after a tab, and non-letter tokens are
+    ignored.
 
     Args:
         dic_path: Path to the .dic file.
+        encoding: Encoding declared by the matching affix file.
+        flag_mode: Hunspell ``FLAG`` mode: ``char``, ``long``, or ``num``.
 
     Returns:
-        List of (normalized_word, flags) tuples.
+        List of (normalized word, flag tokens).
 
     Raises:
-        UnicodeDecodeError: If file is not valid UTF-8.
-        OSError: If file cannot be read.
+        OSError: If the file cannot be read.
     """
-    entries: list[tuple[str, str]] = []
-    with open(dic_path, "r", encoding="utf-8") as f:
-        first = True
-        for line in f:
-            if not (stripped := line.strip()):
+
+    entries: list[tuple[str, tuple[str, ...]]] = []
+    first = True
+    for line in _read_text(dic_path, encoding).splitlines():
+        # Morphological data after a tab is not part of the word.
+        head = line.split("\t", 1)[0].strip()
+        if not head or any(ch.isspace() for ch in head):
+            continue
+        if first:
+            first = False
+            if head.isdigit():
                 continue
-            if first:
-                first = False
-                if stripped.isdigit():
-                    continue
-            # entry like: Wort/FLAGS or just Wort
-            base, flags = stripped.split("/", 1) if "/" in stripped else (stripped, "")
-            base_norm = _normalize_word(base)
-            entries.append((base_norm, flags))
+        if "/" in head:
+            base, flags = head.split("/", 1)
+            flags = flags.split()[0] if flags.split() else ""
+        else:
+            base, flags = head, ""
+        base_norm = _normalize_word(base)
+        if not _is_letter_word(base_norm):
+            continue
+        entries.append((base_norm, _split_flags(flags, flag_mode)))
     return entries
 
-class AffRules:  # pylint: disable=too-few-public-methods
-    """Container for affix rules parsed from .aff files.
 
-    Stores suffix (SFX) and prefix (PFX) rules keyed by flag characters.
-    """
+class AffRules:  # pylint: disable=too-few-public-methods
+    """Suffix and prefix rules plus the flags that cannot stand alone."""
 
     def __init__(self) -> None:
-        """Initialize empty suffix and prefix rule dictionaries."""
+        """Initialize empty rule tables and special-flag sets."""
         self.sfx: dict[str, list[tuple[str, str, str]]] = {}
         self.pfx: dict[str, list[tuple[str, str, str]]] = {}
+        self.flag_mode = "char"
+        self.encoding = "utf-8"
+        self.forbidden_flags: set[str] = set()
+        self.need_affix_flags: set[str] = set()
+        self.only_compound_flags: set[str] = set()
 
     def add_rule(  # pylint: disable=too-many-arguments,too-many-positional-arguments
         self, is_suffix: bool, flag: str, strip: str, add: str, cond: str
@@ -272,178 +482,262 @@ class AffRules:  # pylint: disable=too-few-public-methods
         """Add an affix rule.
 
         Args:
-            is_suffix: True for suffix (SFX), False for prefix (PFX).
-            flag: Flag character identifying this rule group.
-            strip: Characters to remove from base word.
-            add: Characters to add after stripping.
-            cond: Condition pattern for matching.
+            is_suffix: True for a suffix (SFX), False for a prefix (PFX).
+            flag: Flag token that selects this rule group.
+            strip: Characters to remove from the base word.
+            add: Characters to append or prepend after stripping.
+            cond: Condition pattern matched against the stem.
         """
+
         store = self.sfx if is_suffix else self.pfx
-        lst = store.setdefault(flag, [])
-        lst.append((strip, add, cond))
+        store.setdefault(flag, []).append((strip, add, cond))
+
+    def blocks_standalone(self, flags: tuple[str, ...]) -> bool:
+        """Return True when the base word is not a legal standalone guess.
+
+        Args:
+            flags: Flag tokens attached to a dictionary entry.
+
+        Returns:
+            True for forbidden words, compound-only stems, and stems that
+            require an affix.
+        """
+
+        flag_set = set(flags)
+        if flag_set & self.forbidden_flags:
+            return True
+        if flag_set & self.only_compound_flags:
+            return True
+        if flag_set & self.need_affix_flags:
+            return True
+        return False
+
+    def can_generate(self, flags: tuple[str, ...]) -> bool:
+        """Return True when affixes may be applied to this entry.
+
+        Forbidden words and compound-only stems are not expanded. Stems that
+        merely need an affix are expanded, and the bare stem is rejected
+        separately.
+
+        Args:
+            flags: Flag tokens attached to a dictionary entry.
+
+        Returns:
+            True when suffix or prefix rules may be applied.
+        """
+
+        flag_set = set(flags)
+        if flag_set & self.forbidden_flags:
+            return False
+        if flag_set & self.only_compound_flags:
+            return False
+        return True
+
+
+def _remember_special_flags(
+    pending: dict[str, list[str]], tag: str, raw_flag: str
+) -> bool:
+    """Store a special-flag directive until ``FLAG`` mode is known.
+
+    Args:
+        pending: Lists of raw flag tokens keyed by directive name.
+        tag: Affix-file directive.
+        raw_flag: Flag token as written in the file.
+
+    Returns:
+        True when ``tag`` was a special-flag directive.
+    """
+
+    key = {
+        "FORBIDDENWORD": "forbidden",
+        "NEEDAFFIX": "need",
+        "PSEUDOROOT": "need",
+        "ONLYINCOMPOUND": "compound",
+    }.get(tag)
+    if key is None:
+        return False
+    pending[key].append(raw_flag)
+    return True
+
 
 def parse_aff_rules(aff_path: str) -> AffRules:
-    """Parse minimal SFX/PFX rules from .aff to enable basic inflections.
+    """Parse affix rules and standalone-word flags from an ``.aff`` file.
 
-    Supports: header lines and per-rule lines: SFX|PFX FLAG [Y|N] COUNT and
-    SFX|PFX FLAG strip add condition. Condition is treated as a simple regex
-    fragment; '.' means any, [...] kept.
+    Header lines (``SFX flag Y count``) are ignored. Rule lines contribute
+    strip, add, and condition. A slash in the add column marks continuation
+    flags and is not treated as letters. ``FLAG``, ``FORBIDDENWORD``,
+    ``NEEDAFFIX`` / ``PSEUDOROOT``, and ``ONLYINCOMPOUND`` are honored.
 
     Args:
         aff_path: Path to the .aff file.
 
     Returns:
-        AffRules object.
+        Parsed rules. Empty when the file is missing.
 
     Raises:
-        UnicodeDecodeError: If file is not valid UTF-8.
-        OSError: If file cannot be read.
+        OSError: If the file cannot be read.
     """
-    rules = AffRules()
 
+    rules = AffRules()
     if not os.path.isfile(aff_path):
         return rules
 
-    with open(aff_path, "r", encoding="utf-8") as f:
-        for line in f:
-            if not (stripped := line.strip()) or stripped.startswith("#"):
-                continue
-            if len(parts := stripped.split()) < 4:
-                continue
-            type_tag = parts[0]
-            if type_tag not in ("SFX", "PFX"):
-                continue
-            # header lines look like: SFX A Y 2  (we ignore)
-            # rule lines look like:   SFX A 0 en .
-            if len(parts) >= 5 and parts[2] != "Y" and parts[2] != "N":
-                flag = parts[1]
-                strip = parts[2] if parts[2] != "0" else ""
-                add = parts[3] if parts[3] != "0" else ""
-                cond = parts[4] if len(parts) >= 5 else "."
-                # keep cond as-is (used as simple regex later)
-                rules.add_rule(type_tag == "SFX", flag, strip, add, cond)
+    text, encoding = _read_aff_text(aff_path)
+    rules.encoding = encoding
+    pending: dict[str, list[str]] = {"forbidden": [], "need": [], "compound": []}
+    for line in text.splitlines():
+        stripped = line.split("#", 1)[0].strip()
+        if not stripped:
+            continue
+        parts = stripped.split()
+        tag = parts[0]
+        if tag == "SET" and len(parts) >= 2:
+            rules.encoding = _python_encoding(parts[1])
+            continue
+        if tag == "FLAG" and len(parts) >= 2:
+            mode = parts[1].lower()
+            if mode == "num":
+                rules.flag_mode = "num"
+            elif mode == "long":
+                rules.flag_mode = "long"
+            else:
+                rules.flag_mode = "char"
+            continue
+        if len(parts) >= 2 and _remember_special_flags(pending, tag, parts[1]):
+            continue
+        if tag not in ("SFX", "PFX") or len(parts) < 5:
+            continue
+        # Header lines look like: SFX A Y 2
+        if parts[2] in ("Y", "N"):
+            continue
+        strip = "" if parts[2] == "0" else parts[2]
+        add = _split_affix_add(parts[3])
+        rules.add_rule(tag == "SFX", parts[1], strip, add, parts[4])
+
+    rules.forbidden_flags.update(
+        flag
+        for raw in pending["forbidden"]
+        for flag in _split_flags(raw, rules.flag_mode)
+    )
+    rules.need_affix_flags.update(
+        flag for raw in pending["need"] for flag in _split_flags(raw, rules.flag_mode)
+    )
+    rules.only_compound_flags.update(
+        flag
+        for raw in pending["compound"]
+        for flag in _split_flags(raw, rules.flag_mode)
+    )
     return rules
 
-def _generate_affixed_candidates(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-branches
+
+def _apply_one_affix(
     base: str,
-    flags: str,
-    rules: AffRules,
-    word_length: int,
-    letters_re: re.Pattern[str],
-    blocked_suffix_additions: set[str] | None = None,
-) -> Iterator[str]:
-    """Generate affixed candidates from a base word and flags.
-
-    Args:
-        base: Base word to generate candidates from.
-        flags: Flags string indicating applicable affix rules.
-        rules: AffRules object containing affix rules.
-        word_length: Target word length.
-        letters_re: Compiled regex pattern for valid letters.
-
-    Yields:
-        Generated candidate words matching target length and pattern.
-    """
-    # suffixes
-    for flag in flags:
-        for strip, add, cond in rules.sfx.get(flag, []):
-            if blocked_suffix_additions and add and add.lower() in blocked_suffix_additions:
-                continue
-            stem = base
-            if strip and base.endswith(strip):
-                stem = base[: -len(strip)]
-            elif strip:
-                continue
-            candidate = stem + add
-            # condition: basic match on stem end
-            try:
-                if cond and not re.search(cond + r"$", stem):
-                    continue
-            except re.error:
-                pass
-            if len(candidate) == word_length and letters_re.match(candidate):
-                yield candidate
-        # prefixes
-        for strip, add, cond in rules.pfx.get(flag, []):
-            stem = base
-            if strip and base.startswith(strip):
-                stem = base[len(strip) :]
-            elif strip:
-                continue
-            candidate = add + stem
-            try:
-                if cond and not re.match(r"^" + cond, stem):
-                    continue
-            except re.error:
-                pass
-            if len(candidate) == word_length and letters_re.match(candidate):
-                yield candidate
-
-def expand_with_affixes(
-    entries: list[tuple[str, str]],
-    rules: AffRules,
+    strip: str,
+    add: str,
+    cond: str,
     word_length: int,
     *,
-    blocked_suffix_additions: set[str] | None = None,
-) -> set[str]:
-    """Generate words by applying simple PFX/SFX rules to base forms.
-
-    We apply single prefix OR single suffix (no combinations) to control size.
-    Only words of the target length are kept.
+    is_suffix: bool,
+) -> str | None:
+    """Return one affixed spelling, or None when the rule does not apply.
 
     Args:
-        entries: List of (base_word, flags) tuples.
-        rules: AffRules object containing affix rules.
-        word_length: Target word length.
-        blocked_suffix_additions: Optional set of lowercase suffix strings to skip.
+        base: Base word.
+        strip: Characters to remove before adding.
+        add: Characters to add.
+        cond: Hunspell condition for the remaining stem.
+        word_length: Required length of the result.
+        is_suffix: True when the rule is a suffix.
 
     Returns:
-        Set of generated words matching target length.
+        The affixed word, or None when it does not fit this rule and length.
     """
-    letters_re = re.compile(r"^[a-zäöüß]+$")
-    result: set[str] = set()
 
-    for base, flags in entries:
-        if len(base) == word_length and letters_re.match(base):
-            result.add(base)
-        result.update(
-            _generate_affixed_candidates(
-                base,
-                flags,
-                rules,
-                word_length,
-                letters_re,
-                blocked_suffix_additions,
+    if is_suffix:
+        if strip and base.endswith(strip):
+            stem = base[: -len(strip)]
+        elif strip:
+            return None
+        else:
+            stem = base
+        if not _affix_condition_matches(cond, stem, at_end=True):
+            return None
+        candidate = stem + add
+    else:
+        if strip and base.startswith(strip):
+            stem = base[len(strip) :]
+        elif strip:
+            return None
+        else:
+            stem = base
+        if not _affix_condition_matches(cond, stem, at_end=False):
+            return None
+        candidate = add + stem
+    if candidate == base or len(candidate) != word_length:
+        return None
+    if not candidate.isalpha():
+        return None
+    return candidate
+
+
+def _generate_affixed_candidates(
+    base: str,
+    flags: tuple[str, ...],
+    rules: AffRules,
+    word_length: int,
+) -> Iterator[str]:
+    """Yield words formed by one suffix or one prefix.
+
+    Args:
+        base: Base word.
+        flags: Flag tokens that select affix rules.
+        rules: Parsed affix rules.
+        word_length: Required length.
+
+    Yields:
+        Affixed words of ``word_length`` that contain only letters.
+    """
+
+    for flag in flags:
+        for strip, add, cond in rules.sfx.get(flag, []):
+            candidate = _apply_one_affix(
+                base, strip, add, cond, word_length, is_suffix=True
             )
-        )
+            if candidate:
+                yield candidate
+        for strip, add, cond in rules.pfx.get(flag, []):
+            candidate = _apply_one_affix(
+                base, strip, add, cond, word_length, is_suffix=False
+            )
+            if candidate:
+                yield candidate
 
+
+def expand_with_affixes(
+    entries: list[tuple[str, tuple[str, ...]]],
+    rules: AffRules,
+    word_length: int,
+) -> set[str]:
+    """Generate words by applying one prefix or one suffix.
+
+    Forbidden entries and compound-only stems are not expanded. The bare base
+    words are not included here; callers decide which bases can stand alone.
+
+    Args:
+        entries: List of (base word, flag tokens).
+        rules: Parsed affix rules.
+        word_length: Target word length.
+
+    Returns:
+        Affixed words of the target length.
+    """
+
+    result: set[str] = set()
+    for base, flags in entries:
+        if not rules.can_generate(flags):
+            continue
+        result.update(_generate_affixed_candidates(base, flags, rules, word_length))
     return result
-
-
-def _prune_blocked_suffix_bases(
-    words: set[str],
-    blocked_suffixes: set[str],
-    catalog: set[str],
-) -> None:
-    """Remove words that appear to be base-plus-blocked-suffix variants."""
-
-    if not blocked_suffixes or not words:
-        return
-
-    normalized_catalog = {entry.lower() for entry in catalog}
-    removals: set[str] = set()
-    for word in words:
-        lower_word = word.lower()
-        for suffix in blocked_suffixes:
-            if not suffix:
-                continue
-            if not lower_word.endswith(suffix):
-                continue
-            stem = lower_word[: -len(suffix)]
-            if stem and stem in normalized_catalog:
-                removals.add(word)
-                break
-    words.difference_update(removals)
 
 
 @dataclass(slots=True)
@@ -465,44 +759,51 @@ def _collect_dictionary_word_data(
     dict_folder: str,
     word_length: int,
     logger: logging.Logger,
-    lang: str,
 ) -> DictionaryWordData:
-    """Collect dictionary candidates by combining all available aff/dic pairs."""
+    """Collect standalone bases, affixed forms, and a stem catalog.
+
+    Forbidden words and compound-only stems are dropped. Stems marked
+    ``NEEDAFFIX`` stay in the catalog so inflections can be recognized, and
+    they are omitted from the standalone base list.
+
+    Args:
+        dict_folder: Directory of matching ``.aff`` / ``.dic`` pairs.
+        word_length: Target word length for bases and affixed forms.
+        logger: Logger used while the dictionary files are loaded.
+
+    Returns:
+        Bases, affixed forms, and the catalog of stems.
+
+    Raises:
+        ValueError: If the dictionary files contain no usable entries.
+        FileNotFoundError: If ``dict_folder`` does not exist.
+    """
 
     dict_pairs = _find_matching_dict_pairs(dict_folder)
-
     combined_rules, all_entries = _load_dictionary_components(dict_pairs, logger)
     if not all_entries:
         raise ValueError(
             f"Dictionary files in '{dict_folder}' do not contain any entries."
         )
 
-    base_words = {base for base, _ in all_entries if len(base) == word_length}
-    blocked_suffixes: set[str] = set()
-    normalized_lang = (lang or "").strip().lower()
-    if normalized_lang:
-        archetype = normalized_lang.split("-", 1)[0]
-        if archetype:
-            blocked_suffixes.update(
-                suffix.lower()
-                for suffix in load_filter_config(archetype).suffixes
-                if suffix
-            )
-    blocked_suffixes.update(
-        suffix.lower() for suffix in load_filter_config("global").suffixes if suffix
-    )
-    affixed_words = expand_with_affixes(
-        all_entries,
-        combined_rules,
-        word_length,
-        blocked_suffix_additions=blocked_suffixes or None,
-    )
-    source_catalog = {base for base, _ in all_entries}
-    _prune_blocked_suffix_bases(base_words, blocked_suffixes, source_catalog)
-    _prune_blocked_suffix_bases(affixed_words, blocked_suffixes, source_catalog)
-    catalog = {base for base, _ in all_entries}
+    blocked_source = combined_rules.forbidden_flags | combined_rules.only_compound_flags
+    base_words: set[str] = set()
+    catalog: set[str] = set()
+    for base, flags in all_entries:
+        if set(flags) & blocked_source:
+            continue
+        catalog.add(base)
+        if len(base) == word_length and not combined_rules.blocks_standalone(flags):
+            base_words.add(base)
 
-    return DictionaryWordData(base_words=base_words, affixed_words=affixed_words, catalog=catalog)
+    affixed_words = expand_with_affixes(all_entries, combined_rules, word_length)
+    affixed_words.difference_update(base_words)
+    return DictionaryWordData(
+        base_words=base_words,
+        affixed_words=affixed_words,
+        catalog=catalog,
+    )
+
 
 def cache_path(lang: str, word_length: int) -> str:
     """Generate cache file path for a language and word length.
@@ -522,8 +823,9 @@ def cache_path(lang: str, word_length: int) -> str:
         except OSError:
             pass
     return os.path.normpath(
-        os.path.join(cache_dir, f"{lang}_{word_length}_utf-8.txt")
+        os.path.join(cache_dir, f"{lang}_{word_length}_v{CACHE_VERSION}.txt")
     )
+
 
 def load_cache(lang: str, word_length: int) -> set[str]:
     """Load cached word list from disk.
@@ -544,6 +846,7 @@ def load_cache(lang: str, word_length: int) -> set[str]:
         return set()
     with open(path, "r", encoding="utf-8") as f:
         return {w for line in f if (w := line.strip())}
+
 
 def save_cache(lang: str, word_length: int, words: set[str]) -> None:
     """Save word list to cache file.
@@ -598,6 +901,7 @@ def clear_cache(lang: str | None = None) -> None:
         except OSError:
             pass
 
+
 def _transliterate_german(word: str) -> str:
     """Convert German umlauts and ß to ASCII equivalents.
 
@@ -609,6 +913,7 @@ def _transliterate_german(word: str) -> str:
     """
     m = {"ä": "ae", "ö": "oe", "ü": "ue", "ß": "ss"}
     return "".join(m.get(ch, ch) for ch in word)
+
 
 def _filter_solutions_by_length(solutions: list[str], word_length: int) -> list[str]:
     """Filter solutions list to words of specified length.
@@ -623,64 +928,134 @@ def _filter_solutions_by_length(solutions: list[str], word_length: int) -> list[
     return list(w for w in solutions if len(w) == word_length)
 
 
+def _select_solution_words(
+    data: DictionaryWordData,
+    lang: str,
+    difficulty: str,
+) -> list[str]:
+    """Choose the secret-word pool for a difficulty.
+
+    Easy and medium use standalone lemmas and drop obvious inflections.
+    Hard keeps every standalone lemma, including irregular plurals that are
+    their own dictionary entries. Chaos also includes generated inflections.
+
+    Args:
+        data: Dictionary bases, affixed forms, and the stem catalog.
+        lang: Language code.
+        difficulty: One of ``easy``, ``medium``, ``hard``, or ``chaos``.
+
+    Returns:
+        Sorted candidate secrets.
+    """
+
+    normalized = (difficulty or "medium").lower()
+    if normalized == "chaos":
+        pool = set(data.combined)
+    elif normalized == "hard":
+        pool = set(data.base_words) or set(data.combined)
+    else:
+        pool = {
+            word
+            for word in data.base_words
+            if not _should_exclude_inflected(word, lang, data.catalog)
+        }
+        if not pool:
+            pool = set(data.base_words) or set(data.combined)
+    return sorted(pool)
+
+
 def _load_or_build_filtered_solutions(
     lang: str,
     word_length: int,
     dict_folder: str,
     logger: logging.Logger,
+    difficulty: str,
     *,
     enable_filters: bool = True,
+    data: DictionaryWordData | None = None,
 ) -> list[str]:
-    """Load or generate a (optionally) filtered solution cache for the language."""
+    """Load or generate the secret list for a language and difficulty.
 
-    cached: list[str] = []
-    if enable_filters:
-        cached = load_filtered_solution_cache(lang, word_length)
-        if cached:
-            logger.info(
-                "Loaded filtered solution cache for %s/%s (%d words)",
-                lang,
-                word_length,
-                len(cached),
-            )
-            return cached
+    Args:
+        lang: Language code.
+        word_length: Target word length.
+        dict_folder: Directory of dictionary files.
+        logger: Logger for cache and filter messages.
+        difficulty: Difficulty that selects the secret pool.
+        enable_filters: When True, apply blacklist and profanity filters.
+        data: Dictionary data already built for the validator, if any.
 
-    data = _collect_dictionary_word_data(dict_folder, word_length, logger, lang)
+    Returns:
+        Secret candidates of ``word_length``.
 
-    generated_words = sorted(data.combined)
-    if not generated_words:
-        raise ValueError(
-            f"Dictionary candidate list empty for language '{lang}' and length {word_length}."
-        )
+    Raises:
+        ValueError: If the dictionary produces no candidates.
+    """
 
-    if not enable_filters:
-        logger.info(
-            "Generated %d dictionary candidates for %s/%s without language filters.",
-            len(generated_words),
-            lang,
-            word_length,
-        )
-        return generated_words
-
-    filtered = apply_language_filters(
-        lang,
-        generated_words,
-        data.catalog,
-        enable_filters=enable_filters,
-    )
-    if not filtered:
-        logger.warning(
-            "Filtered solution list empty for %s/%s; falling back to unfiltered dictionary words.",
-            lang,
-            word_length,
-        )
-        filtered = generated_words
-
-    save_filtered_solution_cache(lang, word_length, filtered)
-    logger.info(
-        "Built filtered solution cache for %s/%s (%d words)",
+    cached = load_filtered_solution_cache(
         lang,
         word_length,
+        difficulty,
+        use_filters=enable_filters,
+    )
+    cached = [word for word in cached if len(word) == word_length]
+    if cached:
+        logger.info(
+            "Loaded solution cache for %s/%s/%s (%d words)",
+            lang,
+            word_length,
+            difficulty,
+            len(cached),
+        )
+        return cached
+
+    if data is None:
+        data = _collect_dictionary_word_data(dict_folder, word_length, logger)
+
+    selected = _select_solution_words(data, lang, difficulty)
+    if not selected:
+        raise ValueError(
+            "Dictionary candidate list empty for language "
+            f"'{lang}' and length {word_length}."
+        )
+
+    if enable_filters:
+        filtered = apply_language_filters(
+            lang,
+            selected,
+            data.catalog,
+            enable_filters=True,
+        )
+        if not filtered:
+            logger.warning(
+                "Filtered solution list empty for %s/%s; "
+                "falling back to the unfiltered %s pool.",
+                lang,
+                word_length,
+                difficulty,
+            )
+            filtered = selected
+    else:
+        filtered = selected
+        logger.info(
+            "Generated %d dictionary candidates for %s/%s without language filters.",
+            len(filtered),
+            lang,
+            word_length,
+        )
+
+    save_filtered_solution_cache(
+        lang,
+        word_length,
+        filtered,
+        difficulty,
+        use_filters=enable_filters,
+    )
+    logger.info(
+        "Built solution cache for %s/%s/%s (%d words)",
+        lang,
+        word_length,
+        difficulty,
         len(filtered),
     )
     return filtered
@@ -724,134 +1099,163 @@ def _looks_plural_en(  # pylint: disable=too-many-return-statements,too-many-bra
 
 
 def _looks_past_tense_en(word: str, catalog: set[str]) -> bool:
-    """Heuristic to detect English past tense (-ed) forms via dictionary lookup."""
+    """Return True for an English past form whose stem is a real word.
 
-    w = word.lower()
-    if len(w) <= 3:
+    Two-letter remainders are ignored. Otherwise ``seed`` and ``need`` look
+    like past forms whenever a short token such as ``se`` is in the dictionary.
+
+    Args:
+        word: Candidate secret.
+        catalog: Dictionary stems of any length.
+
+    Returns:
+        True when the word is long enough and the recovered stem is listed.
+    """
+
+    lowered = word.lower()
+    if len(lowered) <= 4:
         return False
-    if w.endswith("ied") and len(w) > 3:
-        stem = w[:-3] + "y"
-        if stem in catalog:
+    if lowered.endswith("ied"):
+        stem = lowered[:-3] + "y"
+        if len(stem) >= 3 and stem in catalog:
             return True
-    if w.endswith("ed") and len(w) > 3:
-        stem = w[:-2]
-        if stem in catalog:
-            return True
-    if w.endswith("t") and len(w) > 3:
-        stem = w[:-1]
-        if stem in catalog and stem + "e" in catalog:
+    if lowered.endswith("ed"):
+        stem = lowered[:-2]
+        if len(stem) >= 3 and stem in catalog:
             return True
     return False
 
 
-def _looks_plural_de(  # pylint: disable=too-many-return-statements
-    word: str, catalog: set[str]
-) -> bool:
-    """Heuristic to detect German plural nouns using dictionary presence."""
+def _looks_gerund_en(word: str, catalog: set[str]) -> bool:
+    """Return True when an English word looks like an ``-ing`` form.
 
-    w = word.lower()
-    if len(w) <= 3:
+    Args:
+        word: Candidate secret.
+        catalog: Dictionary stems of any length.
+
+    Returns:
+        True for forms such as ``running`` whose stem is in the catalog.
+        Short words such as ``king`` and ``spring`` are kept.
+    """
+
+    lowered = word.lower()
+    if len(lowered) <= 5 or not lowered.endswith("ing"):
         return False
-    if w.endswith("innen") and len(w) > 5:
-        stem = w[:-5] + "in"
+    stem = lowered[:-3]
+    if len(stem) >= 3 and stem in catalog:
+        return True
+    if len(stem) >= 4 and stem[-1] == stem[-2] and stem[:-1] in catalog:
+        return True
+    return len(stem) >= 3 and (stem + "e") in catalog
+
+
+def _looks_plural_de(word: str, catalog: set[str]) -> bool:
+    """Return True for a likely German plural, not every word with a short ending.
+
+    Args:
+        word: Candidate secret.
+        catalog: Dictionary stems of any length.
+
+    Returns:
+        True for ``-innen`` plurals and ``-s`` plurals whose singular is listed.
+    """
+
+    lowered = word.lower()
+    if len(lowered) <= 4:
+        return False
+    if lowered.endswith("innen") and len(lowered) > 6:
+        stem = lowered[:-5] + "in"
         if stem in catalog:
             return True
-    if w.endswith("er") and len(w) > 3:
-        stem = w[:-2]
-        if stem in catalog:
-            return True
-    if w.endswith("en") and len(w) > 3 and not w.endswith(("chen", "lein")):
-        stem = w[:-2]
-        if stem in catalog:
-            return True
-    if w.endswith("e") and len(w) > 3:
-        stem = w[:-1]
-        if stem in catalog:
-            return True
-    if w.endswith("s") and len(w) > 3:
-        stem = w[:-1]
-        if stem in catalog:
+    if lowered.endswith("s") and not lowered.endswith("ss"):
+        stem = lowered[:-1]
+        if len(stem) >= 4 and stem in catalog:
             return True
     return False
 
 
 def _looks_past_tense_de(word: str, catalog: set[str]) -> bool:
-    """Heuristic to detect German past tense (Präteritum/Partizip II) forms."""
+    """Return True for a likely German past participle with a ``ge-`` prefix.
 
-    w = word.lower()
-    if len(w) <= 3:
+    Args:
+        word: Candidate secret.
+        catalog: Dictionary stems of any length.
+
+    Returns:
+        True when ``ge`` + stem + ``t`` has ``stem + en`` in the catalog.
+    """
+
+    lowered = word.lower()
+    if len(lowered) <= 5 or not lowered.startswith("ge") or not lowered.endswith("t"):
         return False
-    if w.startswith("ge") and len(w) > 4:
-        if w.endswith("t"):
-            stem = w[2:-1]
-            if stem + "en" in catalog:
-                return True
-        if w.endswith("en"):
-            stem = w[2:]
-            if stem in catalog:
-                return True
-    endings = ("te", "test", "tet", "ten")
-    for ending in endings:
-        if w.endswith(ending) and len(w) > len(ending) + 1:
-            stem = w[: -len(ending)]
-            if stem + "en" in catalog:
-                return True
-    return False
+    stem = lowered[2:-1]
+    return bool(stem) and (stem + "en") in catalog
 
 
 def _should_exclude_inflected(word: str, lang: str, catalog: set[str]) -> bool:
-    """Return True if word appears to be an inflected form to skip on medium mode."""
+    """Return True when an easy or medium secret should skip this inflection.
+
+    Args:
+        word: Candidate secret.
+        lang: Language code. Regional codes such as ``en-gb`` use the base.
+        catalog: Dictionary stems of any length.
+
+    Returns:
+        True when the word looks inflected for English or German.
+    """
 
     if not catalog:
         return False
-    if lang.startswith("en"):
-        return _looks_plural_en(word, catalog) or _looks_past_tense_en(word, catalog)
-    if lang.startswith("de"):
+    normalized = (lang or "").lower()
+    if normalized.startswith("en"):
+        return (
+            _looks_plural_en(word, catalog)
+            or _looks_past_tense_en(word, catalog)
+            or _looks_gerund_en(word, catalog)
+        )
+    if normalized.startswith("de"):
         return _looks_plural_de(word, catalog) or _looks_past_tense_de(word, catalog)
     return False
 
 
-
 def build_validator(
     dict_folder: str, solutions: list[str], lang: str, word_length: int
-):
+) -> tuple[Callable[[str], bool], DictionaryWordData | None]:
     """Create a callable that validates whether a guess is a real word.
 
-    Generates/loads a per-(lang,length) cache to avoid recomputation.
-    Combines all matching .aff/.dic pairs in the directory.
+    Generates or loads a per-language, per-length cache. Forbidden words,
+    compound-only stems, and bare ``NEEDAFFIX`` stems are not accepted.
+    Generated inflections are accepted so guesses such as plurals still work
+    when the secret list is narrower.
 
     Args:
         dict_folder: Directory containing .dic and .aff files.
-        solutions: List of valid solution words.
-        lang: Language code (e.g., 'de').
+        solutions: Solution words that are always accepted at this length.
+        lang: Language code (for example, ``de`` or ``de-at``).
         word_length: Target word length.
 
     Returns:
-        Callable function that takes a word string and returns bool.
+        The validator and, when the dictionary was just parsed, its word data.
+        The word data is ``None`` when a guess cache was loaded.
     """
-    logger = logging.getLogger("anyletters")
 
+    logger = logging.getLogger("anyletters")
     logger.info("Using dictionary folder: %s", dict_folder)
 
-    # Initialize allowed words from solutions
     allowed_len = {_normalize_word(w) for w in solutions if len(w) == word_length}
     backend_name = "solutions-only"
+    data: DictionaryWordData | None = None
 
-    # Try to load cache
     cached_words = load_cache(lang, word_length)
     if cached_words:
         allowed_len = cached_words
         backend_name = "cache-only"
         logger.info(
-            "Loaded cache for %s/%s: %d words",
-            lang, word_length, len(cached_words)
+            "Loaded cache for %s/%s: %d words", lang, word_length, len(cached_words)
         )
     else:
-        # No cache found - need to process dictionaries
-        data = _collect_dictionary_word_data(dict_folder, word_length, logger, lang)
-
+        data = _collect_dictionary_word_data(dict_folder, word_length, logger)
         allowed_len = data.combined
-        # Persist cache
         save_cache(lang, word_length, allowed_len)
         logger.info(
             "Built cache for %s/%s: base=%d affixed=%d total=%d",
@@ -861,13 +1265,9 @@ def build_validator(
             len(data.affixed_words),
             len(allowed_len),
         )
-
         backend_name = ".dic/.aff cache"
 
-    # Include solutions (normalized) regardless of cache or dictionary entries
-    allowed_len |= {
-        _normalize_word(w) for w in solutions if len(w) == word_length
-    }
+    allowed_len |= {_normalize_word(w) for w in solutions if len(w) == word_length}
 
     def is_valid(word: str) -> bool:
         """Check if word is valid according to dictionary and solutions.
@@ -876,25 +1276,26 @@ def build_validator(
             word: Word to validate.
 
         Returns:
-            True if word is valid, False otherwise.
+            True if the word is accepted.
         """
-        wn = _normalize_word(word)
-        if wn in allowed_len:
+
+        normalized = _normalize_word(word)
+        if normalized in allowed_len:
             return True
-        if (lang or "").lower() == "de":
-            alt = _transliterate_german(wn)
-            if alt in allowed_len:
+        if _is_german_lang(lang):
+            alternate = _transliterate_german(normalized)
+            if alternate in allowed_len:
                 logger.info(
-                    "Accepted via transliteration: '%s' -> '%s'", word, alt
+                    "Accepted via transliteration: '%s' -> '%s'", word, alternate
                 )
                 return True
         logger.info("Dictionary rejected: %s", word)
         return False
 
     setattr(is_valid, "backend", backend_name)
-    # Always set allowed_words so caller can use dictionary words when solutions are missing
     setattr(is_valid, "allowed_words", allowed_len)
-    return is_valid
+    return is_valid, data
+
 
 def score_guess(guess: str, target: str) -> list[str]:
     """Score a guess against the target using Wordle-like rules.
@@ -913,7 +1314,15 @@ def score_guess(guess: str, target: str) -> list[str]:
 
     Returns:
         List of marker characters ('G', 'Y', 'B') for each position.
+
+    Raises:
+        ValueError: If ``guess`` and ``target`` have different lengths.
     """
+
+    if len(guess) != len(target):
+        raise ValueError(
+            f"Guess length {len(guess)} does not match target length {len(target)}."
+        )
     length = len(target)
     result = ["B"] * length
     remaining: dict[str, int] = {}
@@ -933,6 +1342,7 @@ def score_guess(guess: str, target: str) -> list[str]:
             result[i] = "Y"
             remaining[g] = count - 1
     return result
+
 
 def _create_cell_label(
     parent: tk.Widget, text: str, bg: str, font: tkfont.Font
@@ -958,6 +1368,7 @@ def _create_cell_label(
         font=font,
     )
 
+
 def _clear_input_cells(input_labels: list[tk.Label]) -> None:
     """Clear all input cell labels.
 
@@ -966,6 +1377,7 @@ def _clear_input_cells(input_labels: list[tk.Label]) -> None:
     """
     for lbl in input_labels:
         lbl.configure(text="")
+
 
 def _is_german_lang(lang: str) -> bool:
     """Check if language is German.
@@ -979,27 +1391,93 @@ def _is_german_lang(lang: str) -> bool:
     normalized = (lang or "").lower()
     return normalized == "de" or normalized.startswith("de-")
 
+
 def _to_key_char(ch: str, lang: str) -> str:
-    """Map input character to keyboard label key respecting language.
+    """Map an input character to its keyboard label.
 
     Args:
         ch: Input character.
-        lang: Language code.
+        lang: Language code. German keeps ß as a single key.
 
     Returns:
-        Mapped character for keyboard lookup.
+        Keyboard label for ``ch``.
     """
+
+    if _is_german_lang(lang) and ch.casefold() == "ß":
+        return "ß"
+    return _display_char(ch)
+
+
+def _extra_keyboard_letters(lang: str, words: list[str]) -> list[str]:
+    """Return extra keyboard keys for letters outside A-Z.
+
+    German always gets Ä, Ö, Ü, and ß. Other letters are taken from the
+    current secret list, most frequent first, so accented languages stay
+    typeable without building a key for every rare character.
+
+    Args:
+        lang: Language code.
+        words: Words that may be chosen as secrets.
+
+    Returns:
+        Extra key labels, German letters first.
+    """
+
+    extras: list[str] = []
+    seen: set[str] = set()
     if _is_german_lang(lang):
-        if ch in ("ä", "ö", "ü"):
-            return ch.upper()
-        if ch in ("Ä", "Ö", "Ü"):
-            return ch
-        if ch == "ß":
-            return "ß"
-    # Default Latin A-Z
-    if "a" <= ch <= "z":
-        return ch.upper()
-    return ch.upper()
+        for label in ("Ä", "Ö", "Ü", "ß"):
+            extras.append(label)
+            seen.add(label)
+    counts: Counter[str] = Counter()
+    for word in words:
+        for ch in set(word):
+            label = _display_char(ch)
+            if not label.isalpha() or "A" <= label <= "Z" or label in seen:
+                continue
+            counts[label] += 1
+    for label, _count in counts.most_common(36):
+        extras.append(label)
+        seen.add(label)
+    return extras
+
+
+def _log_secret_choice(
+    logger: logging.Logger,
+    secret_norm: str,
+    *,
+    hide_secret: bool,
+    backend: str | None = None,
+) -> None:
+    """Log a newly chosen secret, optionally omitting the word itself.
+
+    Args:
+        logger: Application logger.
+        secret_norm: Normalized secret word.
+        hide_secret: When True, log only the length. When False, include the word.
+        backend: Optional validator backend label for the first deal.
+    """
+
+    if hide_secret:
+        if backend is None:
+            logger.info("New secret selected (length %d).", len(secret_norm))
+        else:
+            logger.info(
+                "Secret selected (length %d). Validator backend: %s",
+                len(secret_norm),
+                backend,
+            )
+        return
+    if backend is None:
+        logger.info("New secret selected: '%s'.", secret_norm)
+    else:
+        logger.info(
+            "Secret selected: '%s' (length %d). Validator backend: %s",
+            secret_norm,
+            len(secret_norm),
+            backend,
+        )
+
 
 def play_gui(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals,too-many-branches,too-many-statements
     word_length: int,
@@ -1008,6 +1486,7 @@ def play_gui(  # pylint: disable=too-many-arguments,too-many-positional-argument
     lang: str,
     difficulty: str,
     use_solution_filters: bool = True,
+    hide_secret: bool = True,
 ) -> None:
     """Run the game using a Tkinter GUI.
 
@@ -1020,13 +1499,15 @@ def play_gui(  # pylint: disable=too-many-arguments,too-many-positional-argument
         lang: Language code (e.g., 'de').
         difficulty: Difficulty preset ("easy", "medium", "hard", "chaos").
         use_solution_filters: Whether to apply language filters to dictionary-derived solutions.
+        hide_secret: When False, log the chosen secret word on generation.
     """
     logger = logging.getLogger("anyletters")
     solutions_file_found = os.path.isfile(solutions_path)
     all_solutions = read_solutions_file(solutions_path)
 
-    # Build validator first to get dictionary words if needed
-    validator = build_validator(dict_folder, all_solutions, lang, word_length)
+    validator, dict_data = build_validator(
+        dict_folder, all_solutions, lang, word_length
+    )
     backend = getattr(validator, "backend", "Unknown")
     difficulty = difficulty.lower()
     logger.info("Difficulty selected: %s", difficulty)
@@ -1035,70 +1516,45 @@ def play_gui(  # pylint: disable=too-many-arguments,too-many-positional-argument
         "enabled" if use_solution_filters else "disabled",
     )
 
-    # Get allowed words from validator (includes cache/dictionary words)
-    allowed_words = getattr(validator, "allowed_words", set())
-
-    # If no solutions file or no solutions of required length, use dictionary words
     solutions_by_len = _filter_solutions_by_length(all_solutions, word_length)
-    if not solutions_file_found and difficulty != "chaos":
+    if not (solutions_file_found and solutions_by_len):
         filtered_solutions = _load_or_build_filtered_solutions(
             lang,
             word_length,
             dict_folder,
             logger,
+            difficulty,
             enable_filters=use_solution_filters,
+            data=dict_data,
         )
-        if filtered_solutions:
-            all_solutions = list(filtered_solutions)
-            solutions_by_len = filtered_solutions
+        if solutions_file_found:
+            logger.warning(
+                "Solutions file '%s' contains no words of length %d; "
+                "using %d dictionary words instead.",
+                solutions_path,
+                word_length,
+                len(filtered_solutions),
+            )
+        all_solutions = list(filtered_solutions)
+        solutions_by_len = list(filtered_solutions)
 
     if not solutions_by_len:
-        dictionary_candidates: list[str] = []
-        allowed_list: list[str] = []
-        if allowed_words:
-            # Convert set to list for compatibility
-            allowed_list = sorted(list(allowed_words))
-            dictionary_candidates = _filter_solutions_by_length(allowed_list, word_length)
-        if dictionary_candidates:
-            if solutions_file_found:
-                logger.warning(
-                    (
-                        "Solutions file '%s' contains no words of length %d; "
-                        "using %d dictionary words instead."
-                    ),
-                    solutions_path,
-                    word_length,
-                    len(dictionary_candidates),
-                )
-            else:
-                logger.warning(
-                    (
-                        "No solutions file found (tried: %s); "
-                        "using %d dictionary words instead."
-                    ),
-                    solutions_path,
-                    len(dictionary_candidates),
-                )
-            all_solutions = allowed_list if allowed_list else dictionary_candidates
-            solutions_by_len = dictionary_candidates
-        else:
-            raise ValueError(
-                f"No solutions of length {word_length} found and "
-                f"no dictionary words available for language '{lang}' with length {word_length}."
-            )
+        raise ValueError(
+            f"No solutions of length {word_length} found and "
+            f"no dictionary words available for language '{lang}' "
+            f"with length {word_length}."
+        )
 
     # Pick an unused secret if possible, otherwise any
     chosen = pick_unused_solution(all_solutions, word_length)
-    secret = chosen if chosen is not None else pick_random_solution(all_solutions, word_length)
+    secret = (
+        chosen
+        if chosen is not None
+        else pick_random_solution(all_solutions, word_length)
+    )
     secret_norm = _normalize_word(secret)
     secret_counts = Counter(secret_norm)
-
-    logger.info(
-        "Secret '%s' selected (length %d). Validator backend: %s",
-        secret_norm,
-        word_length,
-        backend,
-    )
+    _log_secret_choice(logger, secret_norm, hide_secret=hide_secret, backend=backend)
 
     root = tk.Tk()
     root.title(f"AnyLetters ({word_length})")
@@ -1128,12 +1584,11 @@ def play_gui(  # pylint: disable=too-many-arguments,too-many-positional-argument
     def color_for_marker(marker: str, for_keyboard: bool = False) -> str:
         """Return color for marker honoring colorblind mode."""
         if marker == "G":
-            return (
-                COLORS.alternate_correct if is_colorblind() else COLORS.correct
-            )
+            return COLORS.alternate_correct if is_colorblind() else COLORS.correct
         if marker == "Y":
             return COLORS.present
         return COLORS.dark_gray if for_keyboard else COLORS.cell_background
+
     # Prepare input buffers
     input_labels: list[tk.Label] = []
     input_chars: list[str] = []
@@ -1164,13 +1619,10 @@ def play_gui(  # pylint: disable=too-many-arguments,too-many-positional-argument
     letter_count_labels: dict[str, tk.Label] = {}
     letter_key_frames: dict[str, tk.Frame] = {}
     letters = [chr(c) for c in range(ord("A"), ord("Z") + 1)]
-    # Add language-specific extra letters to the keyboard
-    extra_letters: list[str] = []
-    if _is_german_lang(lang):
-        extra_letters = ["Ä", "Ö", "Ü", "ß"]
     rows = [letters[:13], letters[13:]]
-    if extra_letters:
-        rows.append(extra_letters)
+    extra_letters = _extra_keyboard_letters(lang, solutions_by_len)
+    for start in range(0, len(extra_letters), 13):
+        rows.append(extra_letters[start : start + 13])
     for row_letters in rows:
         row_frame = tk.Frame(keyboard_frame, bg=COLORS.background)
         row_frame.pack()
@@ -1488,7 +1940,7 @@ def play_gui(  # pylint: disable=too-many-arguments,too-many-positional-argument
         row_labels: list[tk.Label] = []
         for i, ch in enumerate(guess_text):
             bg = color_map.get(markers[i], COLORS.cell_background)
-            cell = _create_cell_label(cells, ch.upper(), bg, font_cell)
+            cell = _create_cell_label(cells, _display_char(ch), bg, font_cell)
             cell.pack(side=tk.LEFT, padx=layout_local.cell_padx)
             row_labels.append(cell)
 
@@ -1511,9 +1963,7 @@ def play_gui(  # pylint: disable=too-many-arguments,too-many-positional-argument
             if ch in letter_key_frames:
                 letter_key_frames[ch].configure(bg=COLORS.light_gray)
             if ch in letter_count_labels:
-                letter_count_labels[ch].configure(
-                    text="", bg=COLORS.light_gray
-                )
+                letter_count_labels[ch].configure(text="", bg=COLORS.light_gray)
 
     def reset_board_for_new_secret(new_secret: str) -> None:
         """Reset the game board for a new secret word.
@@ -1525,10 +1975,7 @@ def play_gui(  # pylint: disable=too-many-arguments,too-many-positional-argument
         secret = new_secret
         secret_norm = _normalize_word(secret)
         secret_counts = Counter(secret_norm)
-        logger.info(
-            "New secret '%s' selected.",
-            secret_norm
-        )
+        _log_secret_choice(logger, secret_norm, hide_secret=hide_secret)
         # Clear guess rows, keep input row
         for child in list(guesses_frame.winfo_children()):
             if child is not input_row:
@@ -1564,7 +2011,7 @@ def play_gui(  # pylint: disable=too-many-arguments,too-many-positional-argument
             return
         guess = "".join(input_chars)
         guess_norm = _normalize_word(guess)
-        if len(guess) != word_length:
+        if len(guess) != word_length or len(guess_norm) != len(secret_norm):
             status_var.set(f"Please enter a word with exactly {word_length} letters.")
             return
         if not validator(guess):
@@ -1701,7 +2148,11 @@ def play_gui(  # pylint: disable=too-many-arguments,too-many-positional-argument
                 if total > 1 and count_label is not None:
                     count_label.configure(text=str(total))
                     multiletter_shown.add(key_char)
-                elif total <= 1 and key_char in multiletter_shown and count_label is not None:
+                elif (
+                    total <= 1
+                    and key_char in multiletter_shown
+                    and count_label is not None
+                ):
                     count_label.configure(text="", bg=new_color)
                     multiletter_shown.discard(key_char)
             else:
@@ -1731,14 +2182,12 @@ def play_gui(  # pylint: disable=too-many-arguments,too-many-positional-argument
             return
         if not ch:
             return
-        # Accept letters (including German umlauts and ß)
-        allowed = "abcdefghijklmnopqrstuvwxyzäöüß"
         lower = ch.lower()
-        if lower not in allowed:
+        if len(lower) != 1 or not lower.isalpha():
             return
         if len(input_chars) >= word_length:
             return
-        display = lower.upper()
+        display = _display_char(lower)
         idx = len(input_chars)
         input_chars.append(lower)
         input_labels[idx].configure(text=display)
@@ -1772,21 +2221,83 @@ def play_gui(  # pylint: disable=too-many-arguments,too-many-positional-argument
     root.minsize(360, 640)
     root.mainloop()
 
-def main() -> None:  # pylint: disable=too-many-locals,too-many-statements
-    """Parse arguments for language and length, then start the GUI game."""
-    # Configure logging (console)
-    logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
-    parser = argparse.ArgumentParser(
-        description="AnyLetters GUI (no fail state)"
+
+def load_baked_defaults() -> dict:
+    """Load packaged or workspace ``defaults.json`` values.
+
+    Missing files and keys fall back to the stock defaults. CLI flags still
+    override these values when the player passes them.
+
+    Returns:
+        Defaults dictionary with ``lang``, ``length``, ``difficulty``,
+        ``disable_solution_filters``, ``exe_name``, and ``hide_secret``.
+    """
+
+    defaults = dict(_STOCK_DEFAULTS)
+    path = _resource_path(_DEFAULTS_FILENAME)
+    if not os.path.isfile(path):
+        return defaults
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        logging.getLogger("anyletters").warning(
+            "Could not read baked defaults from %s: %s", path, exc
+        )
+        return defaults
+    if not isinstance(data, dict):
+        return defaults
+    defaults.update(data)
+    return defaults
+
+
+def _build_arg_parser(defaults: dict | None = None) -> argparse.ArgumentParser:
+    """Return the command-line parser.
+
+    ``--diffiuclty`` remains accepted as an alias of ``--difficulty``.
+    Defaults come from ``defaults.json`` when the build baked one in.
+
+    Args:
+        defaults: Optional defaults dictionary. Loaded from disk when omitted.
+
+    Returns:
+        Configured argument parser.
+    """
+
+    baked = defaults if defaults is not None else load_baked_defaults()
+    lang_default = str(baked.get("lang", _STOCK_DEFAULTS["lang"])).strip() or "en"
+    try:
+        length_default = int(baked.get("length", _STOCK_DEFAULTS["length"]))
+    except (TypeError, ValueError):
+        length_default = int(_STOCK_DEFAULTS["length"])
+    difficulty_default = (
+        str(baked.get("difficulty", _STOCK_DEFAULTS["difficulty"])).strip().lower()
     )
+    if difficulty_default not in ("easy", "medium", "hard", "chaos"):
+        difficulty_default = "medium"
+    disable_filters_default = bool(
+        baked.get(
+            "disable_solution_filters",
+            _STOCK_DEFAULTS["disable_solution_filters"],
+        )
+    )
+    hide_secret_default = bool(baked.get("hide_secret", _STOCK_DEFAULTS["hide_secret"]))
+
+    parser = argparse.ArgumentParser(description="AnyLetters GUI (no fail state)")
     parser.add_argument(
         "--lang",
         type=str,
-        default="en",
-        help="Language code for dictionaries (e.g., de)",
+        default=lang_default,
+        help=f"Language code for dictionaries (default: {lang_default})",
     )
     parser.add_argument(
-        "--length", type=int, default=6, help="Word length to play with"
+        "--length",
+        type=int,
+        default=length_default,
+        help=(
+            f"Word length to play with (1-{_MAX_WORD_LENGTH}; "
+            f"default: {length_default})"
+        ),
     )
     parser.add_argument(
         "--list",
@@ -1795,18 +2306,38 @@ def main() -> None:  # pylint: disable=too-many-locals,too-many-statements
     )
     parser.add_argument(
         "-d",
+        "--difficulty",
         "--diffiuclty",
         dest="difficulty",
         type=str.lower,
         choices=["easy", "medium", "hard", "chaos"],
-        default="medium",
-        help="Select difficulty: easy, medium, hard, or chaos (default: medium).",
+        default=difficulty_default,
+        help=(
+            "easy reveals one letter and uses lemmas; medium uses the same "
+            "lemmas; hard keeps irregular inflected lemmas; chaos also allows "
+            f"generated inflections (default: {difficulty_default})."
+        ),
     )
     parser.add_argument(
         "--disable-solution-filters",
         action="store_true",
+        default=disable_filters_default,
         help="Skip language-based filtering when generating dictionary fallback solutions.",
     )
+    hide_group = parser.add_mutually_exclusive_group()
+    hide_group.add_argument(
+        "--hide-secret",
+        dest="hide_secret",
+        action="store_true",
+        help=("Do not log the chosen secret word (default when hide_secret is true)."),
+    )
+    hide_group.add_argument(
+        "--show-secret",
+        dest="hide_secret",
+        action="store_false",
+        help="Log the chosen secret word when it is generated.",
+    )
+    parser.set_defaults(hide_secret=hide_secret_default)
     parser.add_argument(
         "--clear-cache",
         nargs="?",
@@ -1817,6 +2348,15 @@ def main() -> None:  # pylint: disable=too-many-locals,too-many-statements
             "code to only remove that language's cache."
         ),
     )
+    return parser
+
+
+def main() -> None:  # pylint: disable=too-many-locals,too-many-statements
+    """Parse arguments for language and length, then start the GUI game."""
+    # Configure logging (console)
+    logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
+    baked = load_baked_defaults()
+    parser = _build_arg_parser(baked)
     args = parser.parse_args()
 
     logger = logging.getLogger("anyletters")
@@ -1868,6 +2408,8 @@ def main() -> None:  # pylint: disable=too-many-locals,too-many-statements
         )
 
     word_length = args.length
+    if word_length < 1 or word_length > _MAX_WORD_LENGTH:
+        parser.error(f"Word length must be between 1 and {_MAX_WORD_LENGTH}.")
     solutions_filename = f"{lang_normalized}{word_length}.txt"
     solutions_path_candidate = os.path.join("solutions", solutions_filename)
     solutions_path = _resource_path(solutions_path_candidate)
@@ -1895,10 +2437,12 @@ def main() -> None:  # pylint: disable=too-many-locals,too-many-statements
             lang_for_runtime,
             args.difficulty,
             use_solution_filters=not args.disable_solution_filters,
+            hide_secret=args.hide_secret,
         )
     except (OSError, ValueError, FileNotFoundError) as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
+
 
 if __name__ == "__main__":
     main()

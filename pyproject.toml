@@ -1,0 +1,27 @@
+[tool.black]
+line-length = 88
+target-version = ["py38", "py39", "py310", "py311", "py312"]
+include = '\.pyi?$'
+extend-exclude = '''
+/(
+  external
+  | build
+  | dist
+)/
+'''
+
+[tool.pylint.main]
+ignore-paths = ["external", "build", "dist"]
+
+[tool.pylint."MESSAGES CONTROL"]
+disable = [
+  "too-many-lines",
+  "too-many-arguments",
+  "too-many-locals",
+  "too-many-branches",
+  "too-many-statements",
+  "too-many-positional-arguments",
+  "too-few-public-methods",
+  "too-many-nested-blocks",
+  "too-many-return-statements",
+]

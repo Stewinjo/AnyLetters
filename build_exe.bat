@@ -1,13 +1,28 @@
 @echo off
-setlocal
+setlocal EnableExtensions
 REM Build AnyLetters as a single-file executable (Windows)
 REM Requires: pip install -r requirements.txt (pyinstaller)
 REM
+REM Optional bake flags (forwarded to bake_defaults.py):
+REM   --lang de --length 6 --difficulty easy --require-solutions
+REM   --exe-name AnyLettersDE --disable-solution-filters
+REM
 REM The AnyLetters.spec file includes:
+REM   - defaults.json (baked CLI defaults)
 REM   - solutions/ folder (solutions/<lang><length>.txt)
-REM   - dictionaries submodule (external/dictionaries/dictionaries/<lang>/*.dic and *.aff)
+REM   - dictionaries submodule
+REM   - filters/
 
-set NAME=AnyLetters
+echo Baking defaults (if any bake flags were provided)...
+python bake_defaults.py %*
+if errorlevel 1 (
+    echo.
+    echo Baking defaults failed!
+    exit /b %ERRORLEVEL%
+)
+
+for /f "usebackq delims=" %%I in (`python -c "import json; print(json.load(open('defaults.json', encoding='utf-8')).get('exe_name', 'AnyLetters'))"`) do set "NAME=%%I"
+if "%NAME%"=="" set "NAME=AnyLetters"
 
 echo Building %NAME%...
 echo Using spec file: AnyLetters.spec
@@ -43,3 +58,13 @@ if "%EXIT_CODE%"=="0" (
     exit /b %EXIT_CODE%
 )
 del "%TMP_OUTPUT%"
+
+echo Testing baked defaults via --help...
+dist\%NAME%.exe --help >"%TMP_OUTPUT%" 2>&1
+findstr /C:"default:" "%TMP_OUTPUT%" >nul
+if errorlevel 1 (
+    echo WARNING: could not confirm baked defaults in --help output
+) else (
+    echo [OK] --help shows defaults
+)
+del "%TMP_OUTPUT%" 2>nul

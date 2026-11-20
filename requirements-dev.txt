@@ -1,0 +1,4 @@
+-r requirements.txt
+black>=24.8.0
+pre-commit>=3.8.0
+pylint>=3.2.0
